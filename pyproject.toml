@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pysession-client"
+version = "0.1.0a0"
+description = "A pure-Python client for sending and receiving 1:1 direct messages on the Session messenger network"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Pran", email = "pthowrungrueang@gmail.com" }
+]
+keywords = ["session", "messenger", "client", "e2ee"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "pynacl>=1.5.0",
+    "protobuf>=4.25.0",
+    "requests>=2.31.0",
+    "cryptography>=41.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/PranThow/pysession-client"
+Issues = "https://github.com/PranThow/pysession-client/issues"

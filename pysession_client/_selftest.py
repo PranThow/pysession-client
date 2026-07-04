@@ -1,6 +1,6 @@
 """Local self-consistency tests for the crypto layer (no network calls).
 
-Run: python -m pysession._selftest
+Run: python -m pysession_client._selftest
 """
 import nacl.bindings as sodium
 

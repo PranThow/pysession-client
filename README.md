@@ -85,7 +85,7 @@ Lower-level building blocks (`keys`, `mnemonic`, `envelope`, `onion`, `network`,
 ## Self-test (no network required)
 
 ```
-python -m pysession._selftest
+python -m pysession_client._selftest
 ```
 
 Exercises mnemonic encode/decode, key derivation determinism, and the full

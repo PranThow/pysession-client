@@ -4,7 +4,7 @@ Run: python -m pysession_client._selftest
 """
 import nacl.bindings as sodium
 
-from . import attachments, envelope, keys, mnemonic
+from . import attachments, envelope, keys, mnemonic, retrieve
 
 
 def test_mnemonic_roundtrip():
@@ -87,6 +87,31 @@ def test_envelope_roundtrip():
     print("envelope build + decrypt + verify + parse roundtrip: OK, body =", repr(body))
 
 
+def test_disappearing_message_roundtrip():
+    alice = keys.from_seed(b"\x33" * 16)
+    bob = keys.from_seed(b"\x44" * 16)
+
+    env_bytes = envelope.build_encrypted_envelope(
+        alice, bob.x25519_pk, "gone in 30",
+        expiration_type=envelope.EXPIRATION_TYPE_DELETE_AFTER_READ,
+        expiration_seconds=30,
+    )
+    _, body, _, expire_seconds, expire_after_read = retrieve.decrypt_envelope(
+        env_bytes, bob.x25519_pk, bob.x25519_sk
+    )
+    assert body == "gone in 30"
+    assert expire_seconds == 30
+    assert expire_after_read is True
+
+    # A message with no timer set should decode as "no expiration", not 0/False-by-accident.
+    plain_env_bytes = envelope.build_encrypted_envelope(alice, bob.x25519_pk, "sticks around")
+    _, _, _, no_expire_seconds, _ = retrieve.decrypt_envelope(
+        plain_env_bytes, bob.x25519_pk, bob.x25519_sk
+    )
+    assert no_expire_seconds is None
+    print("disappearing-message envelope roundtrip: OK, expire_seconds =", expire_seconds)
+
+
 def test_attachment_crypto_and_pointer_roundtrip():
     import os
     plaintext = os.urandom(5000)
@@ -113,5 +138,6 @@ if __name__ == "__main__":
     test_mnemonic_roundtrip()
     test_key_derivation_deterministic()
     test_envelope_roundtrip()
+    test_disappearing_message_roundtrip()
     test_attachment_crypto_and_pointer_roundtrip()
     print("All self-tests passed.")

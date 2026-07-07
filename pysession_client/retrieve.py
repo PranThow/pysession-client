@@ -48,8 +48,10 @@ def retrieve_raw(pool, swarm, session_id_hex: str, ed25519_sk: bytes, last_hash:
 
 def decrypt_envelope(envelope_bytes: bytes, my_x25519_pk: bytes, my_x25519_sk: bytes):
     """Parse+decrypt a stored Envelope protobuf, returning (sender_ed25519_pk, body_text,
-    attachments) — attachments is a list of parsed AttachmentPointer dicts (see
-    attachments.parse_pointer), empty if the message carried none."""
+    attachments, expire_seconds, expire_after_read) — attachments is a list of parsed
+    AttachmentPointer dicts (see attachments.parse_pointer), empty if the message carried
+    none. expire_seconds is the disappearing-message timer (None if the message doesn't
+    carry one); expire_after_read is True for delete-after-read, False for delete-after-send."""
     ws_fields = pw.parse_message(envelope_bytes)
     request_fields = pw.parse_message(ws_fields[2][0])
     envelope_fields = pw.parse_message(request_fields[3][0])
@@ -70,4 +72,6 @@ def decrypt_envelope(envelope_bytes: bytes, my_x25519_pk: bytes, my_x25519_sk: b
     dm_fields = pw.parse_message(content_fields[1][0])
     body = dm_fields[1][0].decode("utf-8") if 1 in dm_fields else ""
     attachment_list = [attachments_mod.parse_pointer(p) for p in dm_fields.get(2, [])]
-    return sender_pk, body, attachment_list
+    expire_seconds = content_fields[13][0] if 13 in content_fields else None
+    expire_after_read = content_fields.get(12, [None])[0] == 1
+    return sender_pk, body, attachment_list, expire_seconds, expire_after_read

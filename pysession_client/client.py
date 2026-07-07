@@ -18,6 +18,13 @@ from . import network
 from . import retrieve as retrieve_mod
 
 
+def _expiration_type(expire_seconds, expire_after_read):
+    if not expire_seconds:
+        return None
+    return (envelope_mod.EXPIRATION_TYPE_DELETE_AFTER_READ if expire_after_read
+            else envelope_mod.EXPIRATION_TYPE_DELETE_AFTER_SEND)
+
+
 class Client:
     def __init__(self, mnemonic: str):
         self.keypair = keys_mod.from_mnemonic(mnemonic)
@@ -46,19 +53,27 @@ class Client:
         pool, swarm = self._get_swarm_or_raise(session_id)
         return network.store_message(pool, swarm, session_id, envelope_bytes)
 
-    def send(self, session_id: str, text: str) -> dict:
+    def send(self, session_id: str, text: str, expire_seconds: int = None,
+              expire_after_read: bool = False) -> dict:
         """Encrypt `text` for `session_id` and store it in their swarm. Returns the
-        storage server's raw JSON response."""
+        storage server's raw JSON response.
+
+        Pass `expire_seconds` to attach Session's disappearing-message timer (deleted
+        that many seconds after read if `expire_after_read`, else after send)."""
         recipient_x25519_pk = keys_mod.session_id_to_x25519_pubkey(session_id)
         envelope_bytes = envelope_mod.build_encrypted_envelope(
-            self.keypair, recipient_x25519_pk, text
+            self.keypair, recipient_x25519_pk, text,
+            expiration_type=_expiration_type(expire_seconds, expire_after_read),
+            expiration_seconds=expire_seconds,
         )
         return self._store(session_id, envelope_bytes)
 
     def send_attachment(self, session_id: str, file_bytes: bytes, content_type: str = None,
-                         file_name: str = None, caption: str = "") -> dict:
+                         file_name: str = None, caption: str = "",
+                         expire_seconds: int = None, expire_after_read: bool = False) -> dict:
         """Upload `file_bytes` to Session's file server, then send an envelope
-        referencing it (with optional `caption` text as the message body)."""
+        referencing it (with optional `caption` text as the message body). See
+        `send()` for `expire_seconds`/`expire_after_read`."""
         uploaded = attachments_mod.upload(self._get_pool(), file_bytes,
                                            content_type=content_type, file_name=file_name)
 
@@ -66,6 +81,22 @@ class Client:
         envelope_bytes = envelope_mod.build_encrypted_envelope(
             self.keypair, recipient_x25519_pk, caption,
             attachment_pointers=[uploaded["pointer_bytes"]],
+            expiration_type=_expiration_type(expire_seconds, expire_after_read),
+            expiration_seconds=expire_seconds,
+        )
+        return self._store(session_id, envelope_bytes)
+
+    def set_disappearing_timer(self, session_id: str, expire_seconds: int,
+                                expire_after_read: bool = False) -> dict:
+        """Announce a disappearing-messages timer change to `session_id`: an empty-body
+        message flagged EXPIRATION_TIMER_UPDATE, same as tapping the timer in a real
+        Session client. Pass expire_seconds=0 to turn disappearing messages off."""
+        recipient_x25519_pk = keys_mod.session_id_to_x25519_pubkey(session_id)
+        envelope_bytes = envelope_mod.build_encrypted_envelope(
+            self.keypair, recipient_x25519_pk, "",
+            flags=envelope_mod.DATA_MESSAGE_FLAG_EXPIRATION_TIMER_UPDATE,
+            expiration_type=_expiration_type(expire_seconds, expire_after_read),
+            expiration_seconds=expire_seconds,
         )
         return self._store(session_id, envelope_bytes)
 
@@ -78,10 +109,11 @@ class Client:
     def receive(self, last_hash: str = "") -> list:
         """Fetch and decrypt messages waiting in this account's own swarm.
 
-        Returns a list of {"sender_session_id", "body", "hash", "attachments"}
-        — "attachments" is a list of pointer dicts (see attachments.parse_pointer),
-        empty if the message carried none; pass one to download_attachment() to
-        fetch its data."""
+        Returns a list of {"sender_session_id", "body", "hash", "attachments",
+        "expire_seconds", "expire_after_read"} — "attachments" is a list of pointer
+        dicts (see attachments.parse_pointer), empty if the message carried none;
+        pass one to download_attachment() to fetch its data. "expire_seconds" is
+        None if the message carries no disappearing-message timer."""
         pool, swarm = self._get_swarm_or_raise(self.session_id)
         raw_messages = retrieve_mod.retrieve_raw(
             pool, swarm, self.session_id, self.keypair.ed25519_sk, last_hash=last_hash
@@ -91,7 +123,8 @@ class Client:
         for m in raw_messages:
             try:
                 envelope_bytes = base64.b64decode(m["data"])
-                sender_ed25519_pk, body, attachment_list = retrieve_mod.decrypt_envelope(
+                (sender_ed25519_pk, body, attachment_list,
+                 expire_seconds, expire_after_read) = retrieve_mod.decrypt_envelope(
                     envelope_bytes, self.keypair.x25519_pk, self.keypair.x25519_sk
                 )
                 sender_session_id = keys_mod.ed25519_pk_to_session_id(sender_ed25519_pk)
@@ -102,5 +135,7 @@ class Client:
                 "body": body,
                 "hash": m.get("hash"),
                 "attachments": attachment_list,
+                "expire_seconds": expire_seconds,
+                "expire_after_read": expire_after_read,
             })
         return out

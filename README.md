@@ -1,35 +1,45 @@
 # pysession-client
 
 A pure-Python client for sending and receiving 1:1 direct messages on the
-[Session](https://getsession.org) messenger network, given your 13-word recovery
-phrase and a recipient's Session ID.
+[Session](https://getsession.org) messenger network, given your 13-word
+recovery phrase and a recipient's Session ID.
 
-Reimplements the parts of Session's protocol needed for this from scratch
-(Ed25519/X25519 key derivation, message encryption, onion-routed swarm
-storage, and attachment upload/download) and has been verified end-to-end
-against the live production network.
+Reimplements the parts of Session's protocol needed for this from scratch —
+no `libsession-util` bindings, no Electron/Node — and has been verified
+end-to-end against the live production network.
 
-## Install
+For how any of this actually works under the hood (cryptography, onion
+routing, wire formats), see **[ARCHITECTURE.md](ARCHITECTURE.md)**. This
+README just covers using the library.
+
+## Installation
 
 ```
 pip install -r requirements.txt
 ```
 
-Dependencies: `pynacl` (libsodium bindings), `cryptography` (AES-GCM for onion
-transport, AES-CBC+HMAC for attachment encryption), `requests` (HTTP),
-`protobuf` (unused directly — the wire format is hand-encoded in
-`proto_wire.py`, no `protoc` required).
+| Package | Version | Used for |
+|---|---|---|
+| `pynacl` | >=1.5.0 | libsodium bindings — Ed25519/X25519 keys, signing, sealed-box encryption |
+| `cryptography` | >=41.0.0 | AES-256-GCM (onion transport), AES-256-CBC+HMAC (attachment encryption) |
+| `requests` | >=2.31.0 | HTTP to seed nodes and onion-routed service nodes |
+| `protobuf` | >=4.25.0 | Declared but unused directly — the protobuf wire format is hand-encoded in `proto_wire.py`, so no `protoc` install is required |
+
+Requires Python 3.9+.
 
 ## Quick start
 
 ```python
-from pysession-client import Client
+from pysession_client import Client
 
-client = Client("your thirdteen word recovery phrase goes here")
+client = Client("your thirteen word recovery phrase goes here")
 print(client.session_id)  # your own Session ID, derived from the phrase
 
 # Send a message as yourself
 client.send("<recipient session id hex>", "Hello world!")
+
+# Send a message that disappears 30 seconds after the recipient reads it
+client.send("<recipient session id hex>", "self-destructing", expire_seconds=30, expire_after_read=True)
 
 # Send a file
 with open("cat.png", "rb") as f:
@@ -50,82 +60,166 @@ previously-seen one (pass the `"hash"` field from a prior message to page
 forward); without it, it returns everything currently stored in your swarm
 (Session's default message TTL is 14 days).
 
-## API reference
+## Included features
 
-### `pysession.Client(mnemonic: str)`
+| Feature | Client method(s) |
+|---|---|
+| Recovery phrase → Session ID derivation | `Client(mnemonic)`, `.session_id` |
+| Sending plain-text 1:1 direct messages | `.send()` |
+| Sending / receiving file attachments | `.send_attachment()`, `.download_attachment()` |
+| Receiving & decrypting your own swarm, with paging | `.receive(last_hash=...)` |
+| Disappearing messages (delete-after-send / delete-after-read) | `.send()`, `.send_attachment()`, `.set_disappearing_timer()` |
+| Full onion-routed swarm transport (bootstrap, swarm lookup, store, signed retrieve) | used internally by all of the above |
+| Offline self-test (mnemonic, keys, envelope crypto, attachments, disappearing messages) | `python -m pysession_client._selftest` |
 
-- **`.session_id`** — your Session ID (`str`, hex, `05`-prefixed).
-- **`.send(session_id: str, text: str) -> dict`** — encrypts `text` for the given
-  recipient and stores it in their swarm. Returns the storage server's raw
-  `store` response (contains a message `hash`, per-node `signature`s, and
-  `expiry` timestamp).
-- **`.send_attachment(session_id: str, file_bytes: bytes, content_type: str = None, file_name: str = None, caption: str = "") -> dict`**
-  — encrypts and uploads `file_bytes` to Session's file server, then sends an
-  envelope referencing it (with optional `caption` text as the message body).
-  Returns the same `store` response shape as `.send`.
-- **`.receive(last_hash: str = "") -> list[dict]`** — fetches and decrypts
-  messages waiting in your own swarm. Each result is
-  `{"sender_session_id": str, "body": str, "hash": str, "attachments": list[dict]}`.
-  Each attachment dict has `content_type`, `file_name`, `size`, `caption`,
-  `width`, `height`, `url`, `key`, `digest` (the last two needed by
-  `download_attachment`). Messages that fail to decrypt (not addressed to you,
-  corrupt, etc.) are silently skipped.
-- **`.download_attachment(attachment: dict) -> bytes`** — fetches and decrypts
-  an attachment dict from `.receive()`'s `"attachments"` list.
+## Upcoming features
 
-Lower-level building blocks (`keys`, `mnemonic`, `envelope`, `onion`, `network`,
-`retrieve`, `attachments`) are all importable directly if you need more
-control — see "Module walkthrough" below.
-
-## Implemented features
-
-- Recovery phrase (13-word mnemonic) → Session ID derivation.
-- Sending plain-text 1:1 direct messages (`Client.send`).
-- Sending and receiving attachments (`Client.send_attachment`,
-  `Client.download_attachment`), uploaded/downloaded from Session's file
-  server over onion-routed requests.
-- Receiving/decrypting messages from your own swarm, with `last_hash` paging
-  (`Client.receive`).
-- Full onion-routed swarm transport: seed-node bootstrap, swarm lookup,
-  `store`, and signed `retrieve`.
-- Offline self-test covering mnemonic, key derivation, the envelope
-  build/seal/decrypt round trip, and attachment encryption + pointer
-  build/parse.
-
-## Features to be implemented
-
-- Group / closed-group messaging (only 1:1 DMs are supported today).
-- Disappearing messages, typing indicators, read receipts.
-- Local persistence — no conversation history or seen-message tracking is
-  kept; callers must manage `hash`/`last_hash` themselves.
+| Feature | Notes |
+|---|---|
+| Group / closed-group messaging | Only 1:1 DMs are supported today |
+| Typing indicators, read receipts | Protocol messages exist (`TypingMessage`, `ReceiptMessage`) but aren't built by this client yet |
+| Voice-message attachment flag | `AttachmentPointer.flags` (`VOICE_MESSAGE`) isn't exposed by `send_attachment()` yet — see [Attachment flags](#attachment-flags) |
+| Local persistence | No conversation history or seen-message tracking; callers manage `hash`/`last_hash` themselves |
+| Local expiry enforcement | See [Disappearing messages](#disappearing-messages) — this library reports timers, it doesn't run a background deleter |
 
 ## Known limitations
 
-- TLS certificate verification is disabled for service-node connections. This
-  is expected/necessary for this network (see "Network transport" above), but
-  worth knowing if you're auditing this code. It's a single switch,
-  `network.VERIFY_TLS`, if a future transport ever needs it flipped.
+- **TLS certificate verification is disabled** for service-node connections
+  (`network.VERIFY_TLS`). This is expected/necessary for this network — Session
+  authenticates nodes by their ed25519/x25519 keys at the protocol layer, not
+  via the CA system — but worth knowing if you're auditing this code.
+- **No local storage.** `pysession-client` is a stateless transport client. It
+  doesn't track which messages you've seen, doesn't delete expired messages,
+  and doesn't persist anything between calls — build that layer yourself on
+  top of `.receive()`'s return values.
 
-## Extending
+## API reference
 
-A few seams exist specifically so features like the above can be added
-without restructuring the send/network layers:
+### `Client(mnemonic: str)`
 
-- **`envelope.seal_content(sender, recipient_pk, content_bytes, timestamp_ms)`**
-  — the shared pad/sign/seal/wrap pipeline. `build_encrypted_envelope` is just
-  a `DataMessage` builder (body + attachments) feeding into it; a typing
-  indicator would build its own `Content` bytes and call this directly.
-- **`Client._store(session_id, envelope_bytes)`** — takes already-sealed
-  envelope bytes and stores them in a swarm. Both `send()` and
-  `send_attachment()` build their envelope and call this rather than
-  duplicating the swarm/store lookup; a future `send_typing_indicator` would
-  do the same.
-- **`network.post_onion_request_to_file_server(pool, method, endpoint, body, headers)`**
-  / **`onion.build_onion_request_to_host(...)`** — the V4 onion-routing path to
-  a non-snode HTTP(S) destination, built for attachment upload/download but
-  general enough for any future non-snode server Session adds.
-- **`network.VERIFY_TLS`** — single toggle for every onion/seed-node HTTP call
-  in `network.py`, described above.
+| Member | Signature | Description |
+|---|---|---|
+| `.session_id` | `str` | Your Session ID (hex, `05`-prefixed) |
+| `.send()` | `(session_id, text, expire_seconds=None, expire_after_read=False) -> dict` | Encrypt `text` and store it in `session_id`'s swarm |
+| `.send_attachment()` | `(session_id, file_bytes, content_type=None, file_name=None, caption="", expire_seconds=None, expire_after_read=False) -> dict` | Upload `file_bytes` to Session's file server, then send an envelope referencing it |
+| `.set_disappearing_timer()` | `(session_id, expire_seconds, expire_after_read=False) -> dict` | Announce a disappearing-messages timer change (or turn it off with `expire_seconds=0`) |
+| `.receive()` | `(last_hash="") -> list[dict]` | Fetch and decrypt messages waiting in your own swarm |
+| `.download_attachment()` | `(attachment: dict) -> bytes` | Fetch and decrypt an attachment dict from `.receive()` |
+
+`.send()` / `.send_attachment()` return the storage server's raw `store`
+response (message `hash`, per-node `signature`s, `expiry` timestamp).
+
+`.receive()` returns a list of:
+
+```python
+{
+    "sender_session_id": str,
+    "body": str,
+    "hash": str,
+    "attachments": list[dict],       # see Attachments below, [] if none
+    "expire_seconds": int | None,    # see Disappearing messages below
+    "expire_after_read": bool,       # only meaningful if expire_seconds is set
+}
+```
+
+Messages that fail to decrypt (not addressed to you, corrupt, etc.) are
+silently skipped.
+
+Lower-level building blocks (`keys`, `mnemonic`, `envelope`, `onion`,
+`network`, `retrieve`, `attachments`) are all importable directly if you need
+more control — see [ARCHITECTURE.md](ARCHITECTURE.md) for what each one does.
+
+## Disappearing messages
+
+Session's disappearing-message timer isn't a per-message flag bolted onto the
+text — it's carried on every message's `Content` (see
+[Reference: types and flags](#reference-types-and-flags) below) while a timer
+is active for the conversation, so a recipient's client can apply it even to
+messages that aren't the one that changed the setting.
+
+| Parameter | Meaning |
+|---|---|
+| `expire_seconds` | How many seconds after the trigger point the message should be deleted. `None` (default) = no timer — the message just lives until the swarm's normal TTL (14 days). |
+| `expire_after_read` | Chooses the trigger point. `False` (default) = **delete after send** — same expiry instant for both sides. `True` = **delete after read** — the clock starts when the recipient opens it, so each side may see it disappear at a different time. Ignored if `expire_seconds` isn't set. |
+
+```python
+# Delete 30 seconds after send (both sides expire at the same instant)
+client.send(recipient, "self-destructing", expire_seconds=30)
+
+# Delete 5 minutes after the recipient reads it
+client.send(recipient, "read this quick", expire_seconds=300, expire_after_read=True)
+```
+
+`set_disappearing_timer(session_id, expire_seconds, expire_after_read=False)`
+sends the dedicated "timer changed" control message real Session clients
+generate when you tap the clock icon in a conversation — an empty-body
+message flagged `EXPIRATION_TIMER_UPDATE` (see below) that recipient apps show
+as a system notice ("X set messages to disappear after..."). It doesn't
+delete anything by itself, and it doesn't set future `.send()` calls to
+auto-apply the timer — each `.send()`/`.send_attachment()` call still needs
+its own `expire_seconds`/`expire_after_read`. Pass `expire_seconds=0` to
+announce the timer being turned off.
+
+**pysession-client does not delete anything itself.** `expire_seconds` /
+`expire_after_read` on a received message just tell you what the sender
+intended — actually hiding/deleting it once expired is up to whatever you
+build on top of `.receive()`.
+
+## Attachments and content types
+
+`content_type` (on `send_attachment()`) and the `"content_type"` key (from
+`.receive()`'s attachment dicts) is a plain MIME-type string, written verbatim
+into `AttachmentPointer.contentType`. Session's protocol doesn't validate or
+restrict it — it's caller-supplied metadata that receiving clients use to
+decide how to render the file. `pysession-client` doesn't sniff or check it
+against the actual bytes either, so it's on you to pass something accurate.
+
+Common values real Session clients use:
+
+| Content type | Rendered as |
+|---|---|
+| `image/jpeg`, `image/png`, `image/gif`, `image/webp` | Inline image preview |
+| `video/mp4`, `video/quicktime` | Inline video player |
+| `audio/aac`, `audio/mp4`, `audio/mpeg` | Audio player (voice notes also set `AttachmentPointer.flags = VOICE_MESSAGE`, see below) |
+| `application/pdf` | Document icon |
+| anything else / omitted | Falls back to a generic file icon + file name |
+
+## Reference: types and flags
+
+### Envelope types
+
+Every message on the wire is wrapped in an `Envelope` with a `type`. This
+client only ever sends/expects `SESSION_MESSAGE`.
+
+| Type | Value | Meaning |
+|---|---|---|
+| `SESSION_MESSAGE` | 6 | Standard 1:1 direct message |
+| `CLOSED_GROUP_MESSAGE` | 7 | Legacy closed-group message — not supported by this client |
+
+### Disappearing-message types (`Content.expirationType`)
+
+| Type | Value | Meaning |
+|---|---|---|
+| *(unset)* | – | No disappearing timer on this message |
+| `DELETE_AFTER_READ` | 1 | Deleted `expirationTimer` seconds after the recipient reads it |
+| `DELETE_AFTER_SEND` | 2 | Deleted `expirationTimer` seconds after it was sent |
+
+Maps directly to the `expire_after_read` argument above (`True`/`False`
+respectively).
+
+### Message flags (`DataMessage.flags`)
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `EXPIRATION_TIMER_UPDATE` | 2 | Marks an empty-body message as a "disappearing timer changed" announcement rather than a real message. Set automatically by `.set_disappearing_timer()`. |
+
+### Attachment flags (`AttachmentPointer.flags`)
+
+<a id="attachment-flags"></a>
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `VOICE_MESSAGE` | 1 | Marks an attachment as a recorded voice note so receiving clients show a waveform/voice player instead of a generic file. **Not currently settable via `send_attachment()`** — see [Upcoming features](#upcoming-features). |
 
 ## Self-test (no network required)
 
@@ -134,178 +228,10 @@ python -m pysession_client._selftest
 ```
 
 Exercises mnemonic encode/decode, key derivation determinism, the full
-envelope build → seal → decrypt → signature-verify → parse round trip, and
-attachment encryption + `AttachmentPointer` build/parse — all locally, without
-touching the network.
+envelope build → seal → decrypt → signature-verify → parse round trip,
+disappearing-message field round-tripping, and attachment encryption +
+`AttachmentPointer` build/parse — all locally, without touching the network.
 
-## Module walkthrough
+## License
 
-| Module | Responsibility |
-|---|---|
-| `mnemonic.py` | 13-word recovery phrase ↔ 16-byte seed |
-| `keys.py` | seed → Ed25519 keypair → X25519 keypair → Session ID |
-| `proto_wire.py` | minimal hand-rolled protobuf wire-format encoder/decoder |
-| `envelope.py` | builds a `DataMessage` (body + attachments), then pads + signs + seals it via `seal_content` |
-| `onion.py` | per-hop AES-GCM crypto + onion-nesting, for both snode and non-snode (file server) destinations |
-| `network.py` | seed-node bootstrap, swarm lookup, `store`, and the file-server request path |
-| `attachments.py` | attachment encryption, `AttachmentPointer` build/parse, file-server upload/download |
-| `retrieve.py` | signed `retrieve` calls + decrypting fetched envelopes |
-| `client.py` | the public `Client` class tying everything together |
-
-## How it works
-
-Session has no central server: messages are end-to-end encrypted, then stored
-on a decentralized network of **service nodes** run by the Oxen/Session
-Foundation network. Nodes are grouped into **swarms** — every Session ID maps
-deterministically to one swarm (typically 5+ nodes) that holds its messages
-until the recipient polls for them or the TTL expires. Requests are routed
-through the network via 3-hop **onion routing**, similar in spirit to Tor, so
-no single node sees both sender and recipient.
-
-### 1. Identity: recovery phrase → Session ID (`mnemonic.py`, `keys.py`)
-
-Session's 13-word "recovery password" is a Monero/Electrum-style mnemonic: 12
-data words plus 1 CRC32 checksum word, matched on a 3-character prefix against
-a fixed 1626-word list (bundled as `wordlist_english.json`). Decoding it yields
-a 16-byte seed.
-
-That seed is zero-padded to 32 bytes and fed to libsodium's
-`crypto_sign_seed_keypair` to derive an **Ed25519 keypair** (used for signing
-messages). The Ed25519 keys are then converted to an **X25519 keypair** (used
-for encryption) via `crypto_sign_ed25519_*_to_curve25519`. Your Session ID is
-simply `0x05` followed by the X25519 public key, hex-encoded.
-
-Because the real entropy is only 16 bytes (zero-padded, not real random data,
-to fit libsodium's 32-byte seed requirement), this is Session's documented
-"128-bit, not 256-bit" security trade-off in exchange for a shorter recovery
-phrase.
-
-### 2. Message construction (`envelope.py`, `proto_wire.py`)
-
-A plaintext message is wrapped in a minimal hand-encoded protobuf structure
-(field numbers taken from libsession-util's `SessionProtos.proto` — no
-`protoc` needed, since only a handful of fields are used):
-
-```
-Envelope { type=SESSION_MESSAGE, timestamp, content=<encrypted Content bytes> }
-Content { dataMessage: DataMessage { body: "hello", timestamp } }
-```
-
-Before encryption, the serialized `Content` is padded to a 160-byte boundary
-(a `0x80` delimiter byte followed by zero-fill — this hides the exact message
-length from anyone who can see ciphertext size). The sender then:
-
-1. Signs `padded_content || sender_ed25519_pubkey || recipient_x25519_pubkey`
-   with their Ed25519 key (proves authorship without an unencrypted "from"
-   field).
-2. Appends the sender's Ed25519 pubkey and the signature to the padded
-   content.
-3. Encrypts the whole thing with libsodium's `crypto_box_seal` — an anonymous
-   sealed box using an ephemeral keypair, so the ciphertext itself reveals no
-   sender information; authentication comes entirely from the signature
-   inside.
-
-The result becomes the `Envelope.content` field, and the serialized `Envelope`
-is what gets base64'd and sent to the network.
-
-### 3. Network transport (`network.py`, `onion.py`)
-
-To deliver a message, a client needs to:
-
-1. **Bootstrap** — fetch an initial pool of live service nodes from one of
-   Session's public seed nodes (`seed1/2/3.getsession.org:4443`), via a plain
-   (non-onion) `get_n_service_nodes` JSON-RPC call. These seed nodes use
-   self-signed TLS certificates — Session authenticates node identity via each
-   node's ed25519/x25519 keys at the protocol layer, not via the CA/TLS
-   system, so certificate verification is intentionally disabled for these
-   connections (see the note in `network.py`).
-2. **Find the recipient's swarm** — send a `get_swarm` RPC call, onion-routed
-   through 2 random relay nodes to a 3rd destination node, asking which nodes
-   are responsible for the recipient's Session ID.
-3. **Store the message** — send a `store` RPC call (recipient pubkey, TTL,
-   timestamp, base64 envelope data, namespace `0` for regular 1:1 DMs),
-   onion-routed the same way, to a random node in the recipient's swarm.
-4. **Retrieve messages** — send a `retrieve` RPC call to a node in *your own*
-   swarm. Unlike `store` (which anyone can call — that's how strangers can
-   message you), `retrieve` requires proving you own the account: the request
-   is signed with your Ed25519 key over the string `"retrieve" + timestamp`
-   (or `"retrieve" + namespace + timestamp` for any namespace other than the
-   default `0`).
-
-#### Onion request format
-
-Each onion "hop" is encrypted independently. The per-hop symmetric crypto
-(confirmed directly from `oxen-storage-server`'s own C++ decryption source,
-`oxenss/crypto/channel_encryption.cpp`) is:
-
-```
-shared_secret = X25519_scalarmult(my_ephemeral_seckey, their_static_pubkey)
-aes_key       = HMAC-SHA256(key="LOKI", msg=shared_secret)
-wire_bytes    = 12-byte random IV || AES-256-GCM(aes_key, iv, plaintext)   # 16-byte tag appended
-```
-
-Layers are nested from the destination outward to the entry ("guard") node.
-Each layer's plaintext is itself a small framed structure (confirmed from
-`oxen-storage-server`'s `onion_processing.cpp`):
-
-```
-[4-byte little-endian length N][N bytes: inner data][remaining bytes: routing JSON]
-```
-
-The routing JSON tells a hop what to do with the inner data:
-- `{"destination": <next hop's ed25519 pubkey>, "ephemeral_key": <hex>}` — relay
-  further to another node.
-- `{"headers": {}}` — this hop is the final destination; the "inner data" at
-  this layer is the raw request body (JSON-RPC text) to hand to the storage
-  server's own RPC dispatcher, not further ciphertext.
-
-The whole nested structure is POSTed as raw bytes to
-`https://<guard-ip>:<guard-port>/onion_req/v2`. The response comes back
-encrypted with the same shared secret used for the destination layer, as
-`{"body": "<json string>", "status": <http status>}`.
-
-### 4. Attachments (`attachments.py`, `onion.py`, `network.py`)
-
-Attachments are uploaded to Session's file server (`filev2.getsession.org`)
-rather than a swarm, and referenced from the message as an `AttachmentPointer`
-(field numbers confirmed against session-desktop's `protos/SignalService.proto`)
-appended to `DataMessage.attachments`:
-
-```
-AttachmentPointer { contentType, key, size, digest, fileName, width, height, caption, url }
-```
-
-**Encryption** (confirmed against session-desktop's
-`ts/util/crypto/attachmentsEncrypter.ts`) is separate from the onion-transport
-crypto above — it's what protects the file at rest on the file server, which
-isn't part of the swarm's end-to-end-encrypted path:
-
-```
-key = 64 random bytes (aesKey = key[:32], macKey = key[32:])
-iv  = 16 random bytes
-ciphertext   = AES-256-CBC(aesKey, iv, plaintext)
-mac          = HMAC-SHA256(macKey, iv || ciphertext)
-encryptedBin = iv || ciphertext || mac
-digest       = SHA256(encryptedBin)
-```
-
-`key` and `digest` go in the `AttachmentPointer` so the recipient can decrypt
-and verify; `encryptedBin` is the file uploaded to the server. This client
-skips Session's extra size-bucket padding step before encrypting — receivers
-already tolerate an attachment whose downloaded size exactly matches the
-pointer's `size` field, so omitting it costs nothing but the size-obfuscation
-privacy benefit.
-
-**Upload/download** — the file server is not a service node, so it can't be
-reached the same way as `get_swarm`/`store`/`retrieve` above. Session instead
-onion-routes an HTTP(S) request to it (confirmed against session-desktop's
-`ts/session/apis/file_server_api/FileServerApi.ts` and
-`ts/session/apis/snode_api/onions.ts`): the relay hop adjacent to the
-destination is told `{"host", "target": "/oxen/v4/lsrpc", "method": "POST"}`
-instead of `{"destination": <ed25519 pubkey>}`, so instead of relaying deeper
-into the onion network it proxies the still-encrypted payload over plain HTTP
-to the file server, which decrypts and dispatches it itself using its own
-static x25519 keypair. The request/response body uses a bencode-like `V4`
-framing (`l<len>:<json metadata><bodylen>:<body>e`) rather than the plain JSON
-`store`/`retrieve` calls use, and — unlike those — the response comes back as
-raw AES-GCM ciphertext with no base64 layer.
+GPLv3 — see [LICENSE](LICENSE).

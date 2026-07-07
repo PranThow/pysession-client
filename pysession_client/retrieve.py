@@ -4,7 +4,9 @@ import time
 
 import nacl.bindings as sodium
 
+from . import attachments as attachments_mod
 from . import network
+from . import proto_wire as pw
 
 DEFAULT_NAMESPACE = 0
 
@@ -38,45 +40,20 @@ def retrieve_raw(pool, swarm, session_id_hex: str, ed25519_sk: bytes, last_hash:
     if last_hash:
         params["last_hash"] = last_hash
 
-    result = network._post_onion_request(
+    result = network.post_onion_request(
         pool[0], [pool[0], pool[1]], target, {"method": "retrieve", "params": params}
     )
     return result.get("messages", [])
 
 
 def decrypt_envelope(envelope_bytes: bytes, my_x25519_pk: bytes, my_x25519_sk: bytes):
-    """Parse+decrypt a stored Envelope protobuf, returning (sender_ed25519_pk, body_text)."""
-    def read_varint(data, i):
-        val, shift = 0, 0
-        while True:
-            b = data[i]
-            i += 1
-            val |= (b & 0x7F) << shift
-            if not (b & 0x80):
-                return val, i
-            shift += 7
-
-    def parse_top_level(data):
-        i = 0
-        fields = {}
-        while i < len(data):
-            key, i = read_varint(data, i)
-            field_num, wiretype = key >> 3, key & 7
-            if wiretype == 0:
-                val, i = read_varint(data, i)
-            elif wiretype == 2:
-                length, i = read_varint(data, i)
-                val = data[i:i + length]
-                i += length
-            else:
-                raise ValueError("unexpected wiretype")
-            fields[field_num] = val
-        return fields
-
-    ws_fields = parse_top_level(envelope_bytes)
-    request_fields = parse_top_level(ws_fields[2])
-    envelope_fields = parse_top_level(request_fields[3])
-    ciphertext = envelope_fields[8]
+    """Parse+decrypt a stored Envelope protobuf, returning (sender_ed25519_pk, body_text,
+    attachments) — attachments is a list of parsed AttachmentPointer dicts (see
+    attachments.parse_pointer), empty if the message carried none."""
+    ws_fields = pw.parse_message(envelope_bytes)
+    request_fields = pw.parse_message(ws_fields[2][0])
+    envelope_fields = pw.parse_message(request_fields[3][0])
+    ciphertext = envelope_fields[8][0]
 
     decrypted = sodium.crypto_box_seal_open(ciphertext, my_x25519_pk, my_x25519_sk)
     sig = decrypted[-64:]
@@ -89,7 +66,8 @@ def decrypt_envelope(envelope_bytes: bytes, my_x25519_pk: bytes, my_x25519_sk: b
     trimmed = padded_content.rstrip(b"\x00")
     content = trimmed[:-1]  # strip the 0x80 delimiter
 
-    content_fields = parse_top_level(content)
-    dm_fields = parse_top_level(content_fields[1])
-    body = dm_fields[1].decode("utf-8")
-    return sender_pk, body
+    content_fields = pw.parse_message(content)
+    dm_fields = pw.parse_message(content_fields[1][0])
+    body = dm_fields[1][0].decode("utf-8") if 1 in dm_fields else ""
+    attachment_list = [attachments_mod.parse_pointer(p) for p in dm_fields.get(2, [])]
+    return sender_pk, body, attachment_list

@@ -20,15 +20,18 @@ ENVELOPE_TYPE_SESSION_MESSAGE = 6
 PAD_BLOCK_SIZE = 160
 
 
-def _build_data_message(body: str, timestamp_ms: int) -> bytes:
+def _build_data_message(body: str, timestamp_ms: int, attachment_pointers=()) -> bytes:
     out = b""
-    out += pw.string_field(1, body)
+    if body:
+        out += pw.string_field(1, body)
+    for pointer_bytes in attachment_pointers:
+        out += pw.message_field(2, pointer_bytes)
     out += pw.varint_field(7, timestamp_ms)
     return out
 
 
-def _build_content(body: str, timestamp_ms: int) -> bytes:
-    data_message = _build_data_message(body, timestamp_ms)
+def _build_content(body: str, timestamp_ms: int, attachment_pointers=()) -> bytes:
+    data_message = _build_data_message(body, timestamp_ms, attachment_pointers)
     return pw.message_field(1, data_message)
 
 
@@ -74,14 +77,30 @@ def _wrap_websocket_message(envelope_bytes: bytes) -> bytes:
     return pw.varint_field(1, 1) + pw.message_field(2, request)
 
 
-def build_encrypted_envelope(sender: Keypair, recipient_x25519_pk: bytes, body: str,
-                              timestamp_ms: int = None) -> bytes:
-    """Returns the serialized WebSocketMessage-wrapped Envelope bytes, ready to base64 and `store`."""
+def seal_content(sender: Keypair, recipient_x25519_pk: bytes, content_bytes: bytes,
+                  timestamp_ms: int = None) -> bytes:
+    """Pad, sign, seal, and envelope-wrap already-built Content protobuf bytes.
+
+    This is the shared pipeline any Content type funnels through — text bodies
+    today (via build_encrypted_envelope), attachments or a typingMessage Content
+    later just need their own builder feeding in here."""
     if timestamp_ms is None:
         timestamp_ms = int(time.time() * 1000)
 
-    content = _build_content(body, timestamp_ms)
-    padded_content = _pad(content)
+    padded_content = _pad(content_bytes)
     ciphertext = _sign_and_seal(padded_content, sender, recipient_x25519_pk)
     envelope_bytes = _build_envelope(ciphertext, timestamp_ms)
     return _wrap_websocket_message(envelope_bytes)
+
+
+def build_encrypted_envelope(sender: Keypair, recipient_x25519_pk: bytes, body: str,
+                              timestamp_ms: int = None, attachment_pointers=()) -> bytes:
+    """Returns the serialized WebSocketMessage-wrapped Envelope bytes, ready to base64 and `store`.
+
+    `attachment_pointers` is a list of already-built AttachmentPointer protobuf
+    bytes (see attachments.py) to include as DataMessage.attachments."""
+    if timestamp_ms is None:
+        timestamp_ms = int(time.time() * 1000)
+
+    content = _build_content(body, timestamp_ms, attachment_pointers)
+    return seal_content(sender, recipient_x25519_pk, content, timestamp_ms)

@@ -5,8 +5,9 @@ A pure-Python client for sending and receiving 1:1 direct messages on the
 phrase and a recipient's Session ID.
 
 Reimplements the parts of Session's protocol needed for this from scratch
-(Ed25519/X25519 key derivation, message encryption, and onion-routed swarm
-storage) and has been verified end-to-end against the live production network.
+(Ed25519/X25519 key derivation, message encryption, onion-routed swarm
+storage, and attachment upload/download) and has been verified end-to-end
+against the live production network.
 
 ## Install
 
@@ -14,9 +15,10 @@ storage) and has been verified end-to-end against the live production network.
 pip install -r requirements.txt
 ```
 
-Dependencies: `pynacl` (libsodium bindings), `cryptography` (AES-GCM),
-`requests` (HTTP), `protobuf` (unused directly — the wire format is hand-encoded
-in `proto_wire.py`, no `protoc` required).
+Dependencies: `pynacl` (libsodium bindings), `cryptography` (AES-GCM for onion
+transport, AES-CBC+HMAC for attachment encryption), `requests` (HTTP),
+`protobuf` (unused directly — the wire format is hand-encoded in
+`proto_wire.py`, no `protoc` required).
 
 ## Quick start
 
@@ -29,9 +31,18 @@ print(client.session_id)  # your own Session ID, derived from the phrase
 # Send a message as yourself
 client.send("<recipient session id hex>", "Hello world!")
 
+# Send a file
+with open("cat.png", "rb") as f:
+    client.send_attachment("<recipient session id hex>", f.read(),
+                            content_type="image/png", file_name="cat.png",
+                            caption="look at this cat")
+
 # Check your own swarm for new messages
 for msg in client.receive():
     print(msg["sender_session_id"], "says:", msg["body"])
+    for attachment in msg["attachments"]:
+        data = client.download_attachment(attachment)
+        print("  attachment:", attachment["file_name"], len(data), "bytes")
 ```
 
 `receive()` takes an optional `last_hash` to only fetch messages newer than a
@@ -48,29 +59,41 @@ forward); without it, it returns everything currently stored in your swarm
   recipient and stores it in their swarm. Returns the storage server's raw
   `store` response (contains a message `hash`, per-node `signature`s, and
   `expiry` timestamp).
+- **`.send_attachment(session_id: str, file_bytes: bytes, content_type: str = None, file_name: str = None, caption: str = "") -> dict`**
+  — encrypts and uploads `file_bytes` to Session's file server, then sends an
+  envelope referencing it (with optional `caption` text as the message body).
+  Returns the same `store` response shape as `.send`.
 - **`.receive(last_hash: str = "") -> list[dict]`** — fetches and decrypts
   messages waiting in your own swarm. Each result is
-  `{"sender_session_id": str, "body": str, "hash": str}`. Messages that fail to
-  decrypt (not addressed to you, corrupt, etc.) are silently skipped.
+  `{"sender_session_id": str, "body": str, "hash": str, "attachments": list[dict]}`.
+  Each attachment dict has `content_type`, `file_name`, `size`, `caption`,
+  `width`, `height`, `url`, `key`, `digest` (the last two needed by
+  `download_attachment`). Messages that fail to decrypt (not addressed to you,
+  corrupt, etc.) are silently skipped.
+- **`.download_attachment(attachment: dict) -> bytes`** — fetches and decrypts
+  an attachment dict from `.receive()`'s `"attachments"` list.
 
 Lower-level building blocks (`keys`, `mnemonic`, `envelope`, `onion`, `network`,
-`retrieve`) are all importable directly if you need more control — see
-"Module walkthrough" below.
+`retrieve`, `attachments`) are all importable directly if you need more
+control — see "Module walkthrough" below.
 
 ## Implemented features
 
 - Recovery phrase (13-word mnemonic) → Session ID derivation.
 - Sending plain-text 1:1 direct messages (`Client.send`).
+- Sending and receiving attachments (`Client.send_attachment`,
+  `Client.download_attachment`), uploaded/downloaded from Session's file
+  server over onion-routed requests.
 - Receiving/decrypting messages from your own swarm, with `last_hash` paging
   (`Client.receive`).
 - Full onion-routed swarm transport: seed-node bootstrap, swarm lookup,
   `store`, and signed `retrieve`.
-- Offline self-test covering mnemonic, key derivation, and the envelope
-  build/seal/decrypt round trip.
+- Offline self-test covering mnemonic, key derivation, the envelope
+  build/seal/decrypt round trip, and attachment encryption + pointer
+  build/parse.
 
 ## Features to be implemented
 
-- Attachments (images, files, voice messages).
 - Group / closed-group messaging (only 1:1 DMs are supported today).
 - Disappearing messages, typing indicators, read receipts.
 - Local persistence — no conversation history or seen-message tracking is
@@ -80,7 +103,29 @@ Lower-level building blocks (`keys`, `mnemonic`, `envelope`, `onion`, `network`,
 
 - TLS certificate verification is disabled for service-node connections. This
   is expected/necessary for this network (see "Network transport" above), but
-  worth knowing if you're auditing this code.
+  worth knowing if you're auditing this code. It's a single switch,
+  `network.VERIFY_TLS`, if a future transport ever needs it flipped.
+
+## Extending
+
+A few seams exist specifically so features like the above can be added
+without restructuring the send/network layers:
+
+- **`envelope.seal_content(sender, recipient_pk, content_bytes, timestamp_ms)`**
+  — the shared pad/sign/seal/wrap pipeline. `build_encrypted_envelope` is just
+  a `DataMessage` builder (body + attachments) feeding into it; a typing
+  indicator would build its own `Content` bytes and call this directly.
+- **`Client._store(session_id, envelope_bytes)`** — takes already-sealed
+  envelope bytes and stores them in a swarm. Both `send()` and
+  `send_attachment()` build their envelope and call this rather than
+  duplicating the swarm/store lookup; a future `send_typing_indicator` would
+  do the same.
+- **`network.post_onion_request_to_file_server(pool, method, endpoint, body, headers)`**
+  / **`onion.build_onion_request_to_host(...)`** — the V4 onion-routing path to
+  a non-snode HTTP(S) destination, built for attachment upload/download but
+  general enough for any future non-snode server Session adds.
+- **`network.VERIFY_TLS`** — single toggle for every onion/seed-node HTTP call
+  in `network.py`, described above.
 
 ## Self-test (no network required)
 
@@ -88,9 +133,10 @@ Lower-level building blocks (`keys`, `mnemonic`, `envelope`, `onion`, `network`,
 python -m pysession_client._selftest
 ```
 
-Exercises mnemonic encode/decode, key derivation determinism, and the full
-envelope build → seal → decrypt → signature-verify → parse round trip locally,
-without touching the network.
+Exercises mnemonic encode/decode, key derivation determinism, the full
+envelope build → seal → decrypt → signature-verify → parse round trip, and
+attachment encryption + `AttachmentPointer` build/parse — all locally, without
+touching the network.
 
 ## Module walkthrough
 
@@ -98,10 +144,11 @@ without touching the network.
 |---|---|
 | `mnemonic.py` | 13-word recovery phrase ↔ 16-byte seed |
 | `keys.py` | seed → Ed25519 keypair → X25519 keypair → Session ID |
-| `proto_wire.py` | minimal hand-rolled protobuf wire-format encoder |
-| `envelope.py` | builds + pads + signs + seals a `DataMessage` into ciphertext |
-| `onion.py` | per-hop AES-GCM crypto + onion-nesting for routing requests |
-| `network.py` | seed-node bootstrap, swarm lookup, `store` |
+| `proto_wire.py` | minimal hand-rolled protobuf wire-format encoder/decoder |
+| `envelope.py` | builds a `DataMessage` (body + attachments), then pads + signs + seals it via `seal_content` |
+| `onion.py` | per-hop AES-GCM crypto + onion-nesting, for both snode and non-snode (file server) destinations |
+| `network.py` | seed-node bootstrap, swarm lookup, `store`, and the file-server request path |
+| `attachments.py` | attachment encryption, `AttachmentPointer` build/parse, file-server upload/download |
 | `retrieve.py` | signed `retrieve` calls + decrypting fetched envelopes |
 | `client.py` | the public `Client` class tying everything together |
 
@@ -216,3 +263,49 @@ The whole nested structure is POSTed as raw bytes to
 `https://<guard-ip>:<guard-port>/onion_req/v2`. The response comes back
 encrypted with the same shared secret used for the destination layer, as
 `{"body": "<json string>", "status": <http status>}`.
+
+### 4. Attachments (`attachments.py`, `onion.py`, `network.py`)
+
+Attachments are uploaded to Session's file server (`filev2.getsession.org`)
+rather than a swarm, and referenced from the message as an `AttachmentPointer`
+(field numbers confirmed against session-desktop's `protos/SignalService.proto`)
+appended to `DataMessage.attachments`:
+
+```
+AttachmentPointer { contentType, key, size, digest, fileName, width, height, caption, url }
+```
+
+**Encryption** (confirmed against session-desktop's
+`ts/util/crypto/attachmentsEncrypter.ts`) is separate from the onion-transport
+crypto above — it's what protects the file at rest on the file server, which
+isn't part of the swarm's end-to-end-encrypted path:
+
+```
+key = 64 random bytes (aesKey = key[:32], macKey = key[32:])
+iv  = 16 random bytes
+ciphertext   = AES-256-CBC(aesKey, iv, plaintext)
+mac          = HMAC-SHA256(macKey, iv || ciphertext)
+encryptedBin = iv || ciphertext || mac
+digest       = SHA256(encryptedBin)
+```
+
+`key` and `digest` go in the `AttachmentPointer` so the recipient can decrypt
+and verify; `encryptedBin` is the file uploaded to the server. This client
+skips Session's extra size-bucket padding step before encrypting — receivers
+already tolerate an attachment whose downloaded size exactly matches the
+pointer's `size` field, so omitting it costs nothing but the size-obfuscation
+privacy benefit.
+
+**Upload/download** — the file server is not a service node, so it can't be
+reached the same way as `get_swarm`/`store`/`retrieve` above. Session instead
+onion-routes an HTTP(S) request to it (confirmed against session-desktop's
+`ts/session/apis/file_server_api/FileServerApi.ts` and
+`ts/session/apis/snode_api/onions.ts`): the relay hop adjacent to the
+destination is told `{"host", "target": "/oxen/v4/lsrpc", "method": "POST"}`
+instead of `{"destination": <ed25519 pubkey>}`, so instead of relaying deeper
+into the onion network it proxies the still-encrypted payload over plain HTTP
+to the file server, which decrypts and dispatches it itself using its own
+static x25519 keypair. The request/response body uses a bencode-like `V4`
+framing (`l<len>:<json metadata><bodylen>:<body>e`) rather than the plain JSON
+`store`/`retrieve` calls use, and — unlike those — the response comes back as
+raw AES-GCM ciphertext with no base64 layer.

@@ -72,6 +72,24 @@ def _encode_ciphertext_plus_json(ciphertext: bytes, obj: dict) -> bytes:
     return struct.pack("<i", len(ciphertext)) + ciphertext + body
 
 
+def _nest_through_path(path: List[SnodeInfo], ciphertext: bytes, ephemeral_pk: bytes,
+                        first_layer_extra: dict):
+    """Wrap `ciphertext` back through `path` (last hop — the one adjacent to the
+    real destination — first, guard last), returning the guard-facing
+    (ciphertext, ephemeral_pk). `first_layer_extra` is merged into the routing
+    info the hop adjacent to the destination decrypts: {"destination": ed25519_hex}
+    to relay on to another snode, or {"host", "target", "method", ...} to have
+    that hop proxy the (still-opaque) ciphertext over plain HTTP to a non-snode
+    server instead (see build_onion_request_to_host)."""
+    routing_info = {**first_layer_extra, "ephemeral_key": ephemeral_pk.hex()}
+    for hop in reversed(path):
+        layer_plaintext = _encode_ciphertext_plus_json(ciphertext, routing_info)
+        hop_pk = bytes.fromhex(hop.x25519_pk_hex)
+        ciphertext, ephemeral_pk = encrypt_for_pubkey(hop_pk, layer_plaintext)
+        routing_info = {"destination": hop.ed25519_pk_hex, "ephemeral_key": ephemeral_pk.hex()}
+    return ciphertext, ephemeral_pk
+
+
 def build_onion_request(path: List[SnodeInfo], destination: SnodeInfo, request_body_bytes: bytes):
     """Build the raw bytes to POST to path[0] (the guard/entry node).
 
@@ -101,18 +119,44 @@ def build_onion_request(path: List[SnodeInfo], destination: SnodeInfo, request_b
     ciphertext, ephemeral_pk = encrypt_for_pubkey(dest_pk, final_combined_payload,
                                                    ephemeral_keypair=(dest_ephemeral_pk, dest_ephemeral_sk))
 
-    # Walk from the last relay hop back to the guard node, each layer wrapping the previous.
-    next_hop_ed25519_hex = destination.ed25519_pk_hex
-    for hop in reversed(path):
-        routing_info = {
-            "destination": next_hop_ed25519_hex,
-            "ephemeral_key": ephemeral_pk.hex(),
-        }
-        layer_plaintext = _encode_ciphertext_plus_json(ciphertext, routing_info)
-        hop_pk = bytes.fromhex(hop.x25519_pk_hex)
-        ciphertext, ephemeral_pk = encrypt_for_pubkey(hop_pk, layer_plaintext)
-        next_hop_ed25519_hex = hop.ed25519_pk_hex
+    ciphertext, ephemeral_pk = _nest_through_path(
+        path, ciphertext, ephemeral_pk, {"destination": destination.ed25519_pk_hex}
+    )
+    wire_bytes = struct.pack("<i", len(ciphertext)) + ciphertext + json.dumps(
+        {"ephemeral_key": ephemeral_pk.hex()}
+    ).encode("utf-8")
+    return wire_bytes, response_shared_secret
 
+
+def build_onion_request_to_host(path: List[SnodeInfo], destination_x25519_pk_hex: str, host: str,
+                                 lsrpc_path: str, request_bytes: bytes,
+                                 protocol: str = "https", port: int = None):
+    """Like build_onion_request, but the final destination is a non-snode HTTPS(ish)
+    server (e.g. Session's file server) rather than another storage server.
+
+    Confirmed against session-desktop's ts/session/apis/snode_api/onions.ts
+    (buildOnionCtxs' `finalRelayOptions` branch) and ts/session/onions/onionSend.ts:
+    the hop adjacent to the destination is told {"host", "target": "/oxen/v4/lsrpc",
+    "method": "POST"[, "protocol", "port"]} instead of {"destination": ed25519_hex},
+    and proxies the still-opaque ciphertext there over plain HTTP(S) — the file
+    server decrypts it itself using its own static x25519 keypair. Unlike the
+    snode case, `request_bytes` (the V4-encoded request, see encode_v4_request) is
+    encrypted for the destination directly, with no {"headers": {}} wrapper.
+    """
+    dest_pk = bytes.fromhex(destination_x25519_pk_hex)
+
+    dest_ephemeral_pk, dest_ephemeral_sk = sodium.crypto_box_keypair()
+    response_shared_secret = sodium.crypto_scalarmult(dest_ephemeral_sk, dest_pk)
+
+    ciphertext, ephemeral_pk = encrypt_for_pubkey(dest_pk, request_bytes,
+                                                   ephemeral_keypair=(dest_ephemeral_pk, dest_ephemeral_sk))
+
+    first_layer_extra = {"host": host, "target": lsrpc_path, "method": "POST"}
+    if protocol == "http":
+        first_layer_extra["protocol"] = protocol
+        first_layer_extra["port"] = port or 80
+
+    ciphertext, ephemeral_pk = _nest_through_path(path, ciphertext, ephemeral_pk, first_layer_extra)
     wire_bytes = struct.pack("<i", len(ciphertext)) + ciphertext + json.dumps(
         {"ephemeral_key": ephemeral_pk.hex()}
     ).encode("utf-8")
@@ -123,3 +167,29 @@ def decrypt_response(response_shared_secret: bytes, wire_bytes: bytes) -> bytes:
     aes_key = _derive_aes_key(response_shared_secret)
     iv, ct_and_tag = wire_bytes[:12], wire_bytes[12:]
     return AESGCM(aes_key).decrypt(iv, ct_and_tag, None)
+
+
+def encode_v4_request(endpoint: str, method: str, headers: dict, body: bytes = None) -> bytes:
+    """Bencode-ish framing non-snode onion destinations use (session-desktop's
+    onionv4.ts encodeV4Request): l<len>:<json metadata>[<bodylen>:<body>]e."""
+    metadata = json.dumps({"endpoint": endpoint, "method": method, "headers": headers or {}}).encode()
+    out = b"l" + str(len(metadata)).encode() + b":" + metadata
+    if body:
+        out += str(len(body)).encode() + b":" + body
+    return out + b"e"
+
+
+def decode_v4_response(data: bytes):
+    """Inverse framing for the response: l<len>:<json metadata><bodylen>:<body>e
+    (responses always include the body part, per onionv4.ts). Returns (metadata
+    dict with "code"/"headers", body bytes)."""
+    if not data or data[:1] != b"l" or data[-1:] != b"e":
+        raise ValueError("Malformed V4 onion response")
+    first_colon = data.index(b":")
+    info_end = first_colon + 1 + int(data[1:first_colon])
+    metadata = json.loads(data[first_colon + 1:info_end])
+
+    second_colon = data.index(b":", info_end)
+    body_len = int(data[info_end:second_colon])
+    body_start = second_colon + 1
+    return metadata, data[body_start:body_start + body_len]

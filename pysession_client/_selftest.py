@@ -4,7 +4,7 @@ Run: python -m pysession_client._selftest
 """
 import nacl.bindings as sodium
 
-from . import envelope, keys, mnemonic
+from . import attachments, envelope, keys, mnemonic
 
 
 def test_mnemonic_roundtrip():
@@ -87,8 +87,31 @@ def test_envelope_roundtrip():
     print("envelope build + decrypt + verify + parse roundtrip: OK, body =", repr(body))
 
 
+def test_attachment_crypto_and_pointer_roundtrip():
+    import os
+    plaintext = os.urandom(5000)
+    encrypted_blob, key, digest = attachments.encrypt_attachment(plaintext)
+    assert attachments.decrypt_attachment(encrypted_blob, key, digest) == plaintext
+
+    pointer_bytes = attachments.build_pointer(
+        "image/png", len(plaintext), "cat.png", key, digest,
+        "http://filev2.getsession.org/file/123", caption="a cat", width=10, height=20,
+    )
+    parsed = attachments.parse_pointer(pointer_bytes)
+    assert parsed["content_type"] == "image/png"
+    assert parsed["file_name"] == "cat.png"
+    assert parsed["size"] == len(plaintext)
+    assert parsed["key"] == key
+    assert parsed["digest"] == digest
+    assert parsed["url"] == "http://filev2.getsession.org/file/123"
+    assert parsed["caption"] == "a cat"
+    assert parsed["width"] == 10 and parsed["height"] == 20
+    print("attachment encrypt/decrypt + pointer build/parse roundtrip: OK")
+
+
 if __name__ == "__main__":
     test_mnemonic_roundtrip()
     test_key_derivation_deterministic()
     test_envelope_roundtrip()
+    test_attachment_crypto_and_pointer_roundtrip()
     print("All self-tests passed.")

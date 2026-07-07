@@ -22,6 +22,9 @@ from .onion import SnodeInfo
 # signal, for this particular decentralized network.
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+VERIFY_TLS = False  # ponytail: single toggle for both request functions below;
+                     # flip to True (or a CA bundle path) if a future transport needs it
+
 SEED_NODES = [
     "https://seed1.getsession.org:4443",
     "https://seed2.getsession.org:4443",
@@ -32,6 +35,13 @@ ONION_REQUEST_PATH = "/onion_req/v2"
 
 DEFAULT_NAMESPACE = 0  # regular 1:1 DM namespace, confirmed via SnodeNamespaces research
 DEFAULT_TTL_MS = 14 * 24 * 60 * 60 * 1000  # 14 days
+
+# The (non-snode) file server used for attachment upload/download, confirmed against
+# session-desktop's ts/session/apis/file_server_api/FileServerTarget.ts (FILE_SERVERS.DEFAULT)
+# and ts/session/apis/index.ts (SERVER_HOSTS.DEFAULT_FILE_SERVER).
+FILE_SERVER_HOST = "filev2.getsession.org"
+FILE_SERVER_X25519_PK = "09324794aa9c11948189762d198c618148e9136ac9582068180661208927ef34"
+LSRPC_PATH = "/oxen/v4/lsrpc"
 
 
 class SessionNetworkError(RuntimeError):
@@ -47,7 +57,7 @@ def _rpc_via_seednode(seed_url: str, method: str, params: dict) -> dict:
         f"{seed_url}/json_rpc",
         json={"method": method, "params": params},
         timeout=10,
-        verify=False,
+        verify=VERIFY_TLS,
     )
     resp.raise_for_status()
     return resp.json()
@@ -82,18 +92,20 @@ def get_snode_pool() -> List[SnodeInfo]:
     raise SessionNetworkError(f"Could not reach any seed node: {last_error}")
 
 
-def _post_onion_request(entry_node: SnodeInfo, path: List[SnodeInfo], destination: SnodeInfo,
-                         rpc_body: dict) -> dict:
+def post_onion_request(entry_node: SnodeInfo, path: List[SnodeInfo], destination: SnodeInfo,
+                        rpc_body: dict) -> dict:
     """rpc_body is the plain JSON-RPC dict (e.g. {"method": "get_swarm", "params": {...}}),
     delivered raw to the destination snode's storage_rpc dispatcher (confirmed against
     oxen-storage-server's onion_processing.cpp: the destination layer is just the raw
-    request body wrapped in a combined-payload structure with a {"headers": {}} marker)."""
+    request body wrapped in a combined-payload structure with a {"headers": {}} marker).
+
+    Public: also used directly by retrieve.py for the signed `retrieve` call."""
     request_body_bytes = json.dumps(rpc_body).encode("utf-8")
     payload, response_shared_secret = onion.build_onion_request(path, destination, request_body_bytes)
     url = f"https://{entry_node.ip}:{entry_node.port}{ONION_REQUEST_PATH}"
     resp = requests.post(url, data=payload,
                           headers={"Content-Type": "application/octet-stream"},
-                          timeout=15, verify=False)
+                          timeout=15, verify=VERIFY_TLS)
     resp.raise_for_status()
 
     raw = resp.content
@@ -125,11 +137,46 @@ def _pick_path_and_target(pool: List[SnodeInfo], target: SnodeInfo = None):
     return guard, [guard, relay], (target or random_target)
 
 
+def _pick_path(pool: List[SnodeInfo]):
+    """Pick a 2-hop relay path with no snode destination — used for non-snode
+    targets like the file server, where the path itself proxies onward over HTTP."""
+    guard, relay = random.sample(pool, 2)
+    return guard, [guard, relay]
+
+
+def post_onion_request_to_file_server(pool: List[SnodeInfo], method: str, endpoint: str,
+                                       body: bytes = None, headers: dict = None):
+    """Onion-route an HTTP request to Session's file server (attachment upload/
+    download) using the V4 (bencode) onion wire format non-snode destinations need.
+    Returns (metadata dict with "code", body bytes)."""
+    guard, path = _pick_path(pool)
+    request_bytes = onion.encode_v4_request(endpoint, method, headers, body)
+    payload, response_shared_secret = onion.build_onion_request_to_host(
+        path, FILE_SERVER_X25519_PK, FILE_SERVER_HOST, LSRPC_PATH, request_bytes,
+        protocol="http", port=80,
+    )
+    url = f"https://{guard.ip}:{guard.port}{ONION_REQUEST_PATH}"
+    resp = requests.post(url, data=payload,
+                          headers={"Content-Type": "application/octet-stream"},
+                          timeout=30, verify=VERIFY_TLS)
+    resp.raise_for_status()
+
+    # V4 responses come back as raw AES-GCM ciphertext, unlike the base64-wrapped
+    # JSON envelope snode (V2) responses use.
+    plaintext = onion.decrypt_response(response_shared_secret, resp.content)
+    metadata, body_bytes = onion.decode_v4_response(plaintext)
+
+    status = metadata.get("code")
+    if status and not (200 <= status < 300):
+        raise SessionNetworkError(f"File server returned status {status}: {metadata}")
+    return metadata, body_bytes
+
+
 def get_swarm(pool: List[SnodeInfo], session_id_hex: str) -> List[SnodeInfo]:
     """Look up the swarm (service nodes responsible for storing) for a Session ID."""
     guard, path, target = _pick_path_and_target(pool)
 
-    result = _post_onion_request(
+    result = post_onion_request(
         guard, path, target,
         {"method": "get_swarm", "params": {"pubkey": session_id_hex}},
     )
@@ -158,4 +205,4 @@ def store_message(pool: List[SnodeInfo], swarm: List[SnodeInfo], session_id_hex:
         "namespace": namespace,
     }
 
-    return _post_onion_request(guard, path, target, {"method": "store", "params": params})
+    return post_onion_request(guard, path, target, {"method": "store", "params": params})

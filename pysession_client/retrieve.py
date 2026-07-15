@@ -8,8 +8,6 @@ from . import attachments as attachments_mod
 from . import network
 from . import proto_wire as pw
 
-DEFAULT_NAMESPACE = 0
-
 
 def _snode_signature(method: str, ed25519_sk: bytes, namespace: int, timestamp_ms: int) -> bytes:
     """Ported from session-desktop's SnodeSignature.getSnodeSignatureParams:
@@ -21,7 +19,7 @@ def _snode_signature(method: str, ed25519_sk: bytes, namespace: int, timestamp_m
 
 
 def retrieve_raw(pool, swarm, session_id_hex: str, ed25519_sk: bytes, last_hash: str = "",
-                  namespace: int = DEFAULT_NAMESPACE) -> list:
+                  namespace: int = network.DEFAULT_NAMESPACE) -> list:
     """Fetch raw stored messages for a Session ID. Retrieval requires a signature
     proving ownership of the account (unlike store, which anyone can do)."""
     target = swarm[0]
